@@ -170,7 +170,105 @@ begin
   perform pg_temp.ok('İstasyon geçmişi sporcuya açık', (select count(*) from public.athlete_segment_stats(ac)) >= 24);
   perform pg_temp.as_user(ud);
   perform pg_temp.fails('Başka salon istasyon geçmişini göremez', format('select * from public.athlete_segment_stats(%L)', ac));
+
+  -- A-1: Askıdaki salon yazamamalı (yeni oturum + join_org); okuma sürmeli
   perform pg_temp.as_admin();
+  insert into auth.users (id, email) values ('a0000000-0000-4000-8000-0000000000f1', 'f1@t.rl');
+  update public.orgs set plan = 'askida' where id = o1;
+  perform pg_temp.ok('A-1 org_can_write askıda false', not app.org_can_write(o1));
+  perform pg_temp.as_user(ub);
+  perform pg_temp.fails('A-1 askıdaki salonda yeni oturum açılamaz',
+    format('insert into public.sessions (org_id, kind, title, config_version_id, status) values (%L, ''simulation'', ''Askı deneme'', %L, ''planned'')', o1, ver));
+  perform pg_temp.as_user('a0000000-0000-4000-8000-0000000000f1');
+  perform pg_temp.fails('A-1 askıdaki salona join_org reddeder', format('select public.join_org(%L, ''Askı Aday'')', code1));
+  perform pg_temp.as_user(uc);
+  perform pg_temp.ok('A-1 askıdaki salonda oturum okuma sürer', (select count(*) from public.sessions where id = s1) = 1);
+  perform pg_temp.ok('A-1 askıdaki salonda canlı sıralama (CSV/okuma) sürer', (select count(*) from public.session_leaderboard(s1)) = 2);
+  perform pg_temp.as_admin();
+  update public.orgs set plan = 'deneme' where id = o1;
+  perform pg_temp.ok('A-1 deneme planında org_can_write true', app.org_can_write(o1));
+
+  -- A-2: Yazma izni yokken oturum geri açılmamalı; canlıya segment/entry mümkün
+  perform pg_temp.as_user(ub);
+  insert into public.sessions (org_id, kind, title, config_version_id, status)
+  values (o1, 'simulation', 'Planlı oturum', ver, 'planned') returning id into bad;
+  update public.sessions set status = 'finished', finished_at = now() where id = s1;
+  perform pg_temp.as_admin();
+  update public.orgs set plan = 'askida' where id = o1;
+  perform pg_temp.as_user(ub);
+  perform pg_temp.fails('A-2 askıda bitmiş oturum planned yapılamaz',
+    format('update public.sessions set status = ''planned'' where id = %L', s1));
+  perform pg_temp.fails('A-2 askıda bitmiş oturum live yapılamaz',
+    format('update public.sessions set status = ''live'' where id = %L', s1));
+  perform pg_temp.fails('A-2 askıda planned oturuma sporcu eklenemez',
+    format('insert into public.session_entries (session_id, org_id, athlete_id, division_code, bib) values (%L, %L, %L, ''open_women'', 99)', bad, o1, ac));
+  -- Canlı oturum: finished'ı geri live yapıp segment/entry senaryosu için ayrı canlı oturum
+  perform pg_temp.as_admin();
+  update public.orgs set plan = 'deneme' where id = o1;
+  perform pg_temp.as_user(ub);
+  insert into public.sessions (org_id, kind, title, config_version_id, status)
+  values (o1, 'simulation', 'Canlı kilit testi', ver, 'live') returning id into ver2;
+  perform pg_temp.as_admin();
+  update public.orgs set plan = 'askida' where id = o1;
+  perform pg_temp.as_user(ub);
+  insert into public.session_entries (session_id, org_id, athlete_id, division_code, bib)
+  values (ver2, o1, ac, 'open_women', 11) returning id into en1;
+  perform pg_temp.ok('A-2 askıda canlı oturuma sporcu eklenebilir', en1 is not null);
+  insert into public.segments (id, entry_id, org_id, segment_index, kind, ref_code, duration_ms)
+  values ('b0000000-0000-4000-8000-0000000000a2', en1, o1, 1, 'run', 'run_1', 111000);
+  perform pg_temp.ok('A-2 askıda canlı oturuma segment eklenebilir',
+    (select count(*) from public.segments where id = 'b0000000-0000-4000-8000-0000000000a2') = 1);
+  update public.sessions set status = 'finished', finished_at = now(), notes = 'tamam' where id = ver2;
+  perform pg_temp.ok('A-2 askıda live→finished ve notes güncellenir',
+    (select status = 'finished' and notes = 'tamam' from public.sessions where id = ver2));
+  update public.sessions set status = 'cancelled' where id = bad;
+  perform pg_temp.ok('A-2 askıda planned→cancelled izinli',
+    (select status from public.sessions where id = bad) = 'cancelled');
+  perform pg_temp.as_admin();
+  update public.orgs set plan = 'deneme' where id = o1;
+
+  -- A-4: Platform yönetici RPC koruması
+  perform pg_temp.as_user(ua);
+  perform pg_temp.fails('A-4 sahip admin_list_orgs çağırmaz', 'select * from public.admin_list_orgs()');
+  perform pg_temp.fails('A-4 sahip admin_set_plan çağırmaz',
+    format('select public.admin_set_plan(%L, ''aktif'', now() + interval ''30 days'', ''not'')', o1));
+  perform set_config('role', 'anon', true); perform set_config('request.jwt.claims', '', true);
+  perform pg_temp.fails('A-4 anon admin_list_orgs çağırmaz', 'select * from public.admin_list_orgs()');
+  perform pg_temp.fails('A-4 anon admin_set_plan çağırmaz',
+    format('select public.admin_set_plan(%L, ''askida'', null, null)', o1));
+  perform pg_temp.as_user(up);
+  perform pg_temp.ok('A-4 platform admin salonları listeler', (select count(*) from public.admin_list_orgs()) >= 2);
+  perform pg_temp.fails('A-4 geçersiz plan reddedilir',
+    format('select public.admin_set_plan(%L, ''gold'', now() + interval ''30 days'', null)', o1));
+  perform pg_temp.fails('A-4 aktif plan paid_until zorunlu',
+    format('select public.admin_set_plan(%L, ''aktif'', null, null)', o1));
+  perform pg_temp.fails('A-4 paid_until en fazla +2 yıl',
+    format('select public.admin_set_plan(%L, ''aktif'', now() + interval ''3 years'', null)', o1));
+  perform public.admin_set_plan(o1, 'aktif', now() + interval '60 days', 'fatura-gizli');
+  perform pg_temp.ok('A-4 admin_set_plan planı günceller', (select plan from public.orgs where id = o1) = 'aktif');
+  perform pg_temp.ok('A-4 admin_set_plan denetim satırı yazar',
+    exists (select 1 from public.audit_log where action = 'admin_set_plan' and entity_id = o1::text));
+
+  -- A-3: Faturalama notu gizliliği (org_billing)
+  perform pg_temp.ok('A-3 admin_set_plan notu org_billing yazar',
+    (select notes from public.org_billing where org_id = o1) = 'fatura-gizli');
+  perform pg_temp.as_user(ua);
+  perform pg_temp.ok('A-3 sahip org_billing okuyamaz', (select count(*) from public.org_billing) = 0);
+  perform pg_temp.ok('A-3 sahip audit_log içinde fatura notunu göremez',
+    not exists (select 1 from public.audit_log where org_id = o1 and details::text ilike '%fatura-gizli%'));
+  perform pg_temp.as_user(uc);
+  perform pg_temp.ok('A-3 sporcu org_billing okuyamaz', (select count(*) from public.org_billing) = 0);
+  perform pg_temp.fails('A-3 sporcu org_billing yazamaz',
+    format('insert into public.org_billing (org_id, notes) values (%L, ''sızma'')', o1));
+  perform pg_temp.as_user(up);
+  perform pg_temp.ok('A-3 platform admin org_billing okur',
+    (select notes from public.org_billing where org_id = o1) = 'fatura-gizli');
+  update public.org_billing set notes = 'guncel-not' where org_id = o1;
+  perform pg_temp.ok('A-3 platform admin org_billing günceller',
+    (select notes from public.org_billing where org_id = o1) = 'guncel-not');
+  perform pg_temp.ok('A-3 admin_list_orgs fatura notu sızdırmaz',
+    not exists (select 1 from public.admin_list_orgs() r where r::text ilike '%guncel-not%'));
+  perform public.admin_set_plan(o1, 'deneme', null, null);
 end $$;
 
 select n, case when ok then 'GECTI' else 'KALDI' end as sonuc, name, left(coalesce(detail, ''), 120) as ayrinti from t_result order by n;
